@@ -9,6 +9,16 @@ import { api } from '../api.js';
 import { showToast } from './toast.js';
 import { escapeHtml, escapeAttr, truncate, capitalize } from '../utils/html.js';
 
+// Simple pluralization for agent type labels
+function pluralize(word, count) {
+  if (count === 1) return word;
+  // Handle special cases
+  if (word.toLowerCase() === 'witness') return 'Witnesses';
+  if (word.toLowerCase() === 'refinery') return 'Refineries';
+  // Default: just add 's'
+  return word + 's';
+}
+
 /**
  * Render the sidebar with agent tree
  * @param {HTMLElement} container - The sidebar container
@@ -82,8 +92,16 @@ function groupByRole(agents) {
     other: [],
   };
 
+  // Map API role names to our group names
+  const roleMap = {
+    'coordinator': 'mayor',
+    'health-check': 'deacon',
+  };
+
   agents.forEach(agent => {
-    const role = agent.role?.toLowerCase() || 'other';
+    const apiRole = agent.role?.toLowerCase() || 'other';
+    // Map coordinator->mayor, health-check->deacon, or use role directly
+    const role = roleMap[apiRole] || apiRole;
     if (groups[role]) {
       groups[role].push(agent);
     } else {
@@ -112,7 +130,7 @@ function renderAgentTree(agentsByRole) {
       <li class="tree-node expandable expanded">
         <div class="tree-node-content">
           <span class="material-icons tree-icon" style="color: ${config.color}">${config.icon}</span>
-          <span class="tree-label" style="color: ${config.color}">${config.label}s</span>
+          <span class="tree-label" style="color: ${config.color}">${pluralize(config.label, agents.length)}</span>
           <span class="tree-badge">${agents.length}</span>
         </div>
         <ul class="tree-children">

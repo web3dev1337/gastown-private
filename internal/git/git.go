@@ -3,7 +3,6 @@ package git
 
 import (
 	"bytes"
-	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -11,13 +10,28 @@ import (
 	"strings"
 )
 
-// Common errors
-var (
-	ErrNotARepo       = errors.New("not a git repository")
-	ErrMergeConflict  = errors.New("merge conflict")
-	ErrAuthFailure    = errors.New("authentication failed")
-	ErrRebaseConflict = errors.New("rebase conflict")
-)
+// GitError contains raw output from a git command for agent observation.
+// ZFC: Callers observe the raw output and decide what to do.
+// The error interface methods provide human-readable messages, but agents
+// should use Stdout/Stderr for programmatic observation.
+type GitError struct {
+	Command string // The git command that failed (e.g., "merge", "push")
+	Args    []string
+	Stdout  string // Raw stdout output
+	Stderr  string // Raw stderr output
+	Err     error  // Underlying error (e.g., exit code)
+}
+
+func (e *GitError) Error() string {
+	if e.Stderr != "" {
+		return fmt.Sprintf("git %s: %s", e.Command, e.Stderr)
+	}
+	return fmt.Sprintf("git %s: %v", e.Command, e.Err)
+}
+
+func (e *GitError) Unwrap() error {
+	return e.Err
+}
 
 // Git wraps git operations for a working directory.
 type Git struct {
@@ -66,71 +80,87 @@ func (g *Git) run(args ...string) (string, error) {
 
 	err := cmd.Run()
 	if err != nil {
-		return "", g.wrapError(err, stderr.String(), args)
+		return "", g.wrapError(err, stdout.String(), stderr.String(), args)
 	}
 
 	return strings.TrimSpace(stdout.String()), nil
 }
 
 // wrapError wraps git errors with context.
-func (g *Git) wrapError(err error, stderr string, args []string) error {
+// ZFC: Returns GitError with raw output for agent observation.
+// Does not detect or interpret error types - agents should observe and decide.
+func (g *Git) wrapError(err error, stdout, stderr string, args []string) error {
+	stdout = strings.TrimSpace(stdout)
 	stderr = strings.TrimSpace(stderr)
 
-	// Detect specific error types
-	if strings.Contains(stderr, "not a git repository") {
-		return ErrNotARepo
+	// Determine command name (first arg, or first non-flag arg)
+	command := ""
+	for _, arg := range args {
+		if !strings.HasPrefix(arg, "-") {
+			command = arg
+			break
+		}
 	}
-	if strings.Contains(stderr, "CONFLICT") || strings.Contains(stderr, "Merge conflict") {
-		return ErrMergeConflict
-	}
-	if strings.Contains(stderr, "Authentication failed") || strings.Contains(stderr, "could not read Username") {
-		return ErrAuthFailure
-	}
-	if strings.Contains(stderr, "needs merge") || strings.Contains(stderr, "rebase in progress") {
-		return ErrRebaseConflict
+	if command == "" && len(args) > 0 {
+		command = args[0]
 	}
 
-	if stderr != "" {
-		return fmt.Errorf("git %s: %s", args[0], stderr)
+	return &GitError{
+		Command: command,
+		Args:    args,
+		Stdout:  stdout,
+		Stderr:  stderr,
+		Err:     err,
 	}
-	return fmt.Errorf("git %s: %w", args[0], err)
 }
 
 // Clone clones a repository to the destination.
 func (g *Git) Clone(url, dest string) error {
 	cmd := exec.Command("git", "clone", url, dest)
-	var stderr bytes.Buffer
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
-		return g.wrapError(err, stderr.String(), []string{"clone", url})
+		return g.wrapError(err, stdout.String(), stderr.String(), []string{"clone", url})
 	}
 	// Configure hooks path for Gas Town clones
-	return configureHooksPath(dest)
+	if err := configureHooksPath(dest); err != nil {
+		return err
+	}
+	// Configure sparse checkout to exclude .claude/ from source repo
+	return ConfigureSparseCheckout(dest)
 }
 
 // CloneWithReference clones a repository using a local repo as an object reference.
 // This saves disk by sharing objects without changing remotes.
 func (g *Git) CloneWithReference(url, dest, reference string) error {
 	cmd := exec.Command("git", "clone", "--reference-if-able", reference, url, dest)
-	var stderr bytes.Buffer
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
-		return g.wrapError(err, stderr.String(), []string{"clone", "--reference-if-able", url})
+		return g.wrapError(err, stdout.String(), stderr.String(), []string{"clone", "--reference-if-able", url})
 	}
 	// Configure hooks path for Gas Town clones
-	return configureHooksPath(dest)
+	if err := configureHooksPath(dest); err != nil {
+		return err
+	}
+	// Configure sparse checkout to exclude .claude/ from source repo
+	return ConfigureSparseCheckout(dest)
 }
 
 // CloneBare clones a repository as a bare repo (no working directory).
 // This is used for the shared repo architecture where all worktrees share a single git database.
 func (g *Git) CloneBare(url, dest string) error {
 	cmd := exec.Command("git", "clone", "--bare", url, dest)
-	var stderr bytes.Buffer
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
-		return g.wrapError(err, stderr.String(), []string{"clone", "--bare", url})
+		return g.wrapError(err, stdout.String(), stderr.String(), []string{"clone", "--bare", url})
 	}
-	return nil
+	// Configure refspec so worktrees can fetch and see origin/* refs
+	return configureRefspec(dest)
 }
 
 // configureHooksPath sets core.hooksPath to use the repo's .githooks directory
@@ -152,15 +182,32 @@ func configureHooksPath(repoPath string) error {
 	return nil
 }
 
-// CloneBareWithReference clones a bare repository using a local repo as an object reference.
-func (g *Git) CloneBareWithReference(url, dest, reference string) error {
-	cmd := exec.Command("git", "clone", "--bare", "--reference-if-able", reference, url, dest)
+// configureRefspec sets remote.origin.fetch to the standard refspec for bare repos.
+// Bare clones don't have this set by default, which breaks worktrees that need to
+// fetch and see origin/* refs. Without this, `git fetch` only updates FETCH_HEAD
+// and origin/main never appears in refs/remotes/origin/main.
+// See: https://github.com/anthropics/gastown/issues/286
+func configureRefspec(repoPath string) error {
+	cmd := exec.Command("git", "-C", repoPath, "config", "remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/*")
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
-		return g.wrapError(err, stderr.String(), []string{"clone", "--bare", "--reference-if-able", url})
+		return fmt.Errorf("configuring refspec: %s", strings.TrimSpace(stderr.String()))
 	}
 	return nil
+}
+
+// CloneBareWithReference clones a bare repository using a local repo as an object reference.
+func (g *Git) CloneBareWithReference(url, dest, reference string) error {
+	cmd := exec.Command("git", "clone", "--bare", "--reference-if-able", reference, url, dest)
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		return g.wrapError(err, stdout.String(), stderr.String(), []string{"clone", "--bare", "--reference-if-able", url})
+	}
+	// Configure refspec so worktrees can fetch and see origin/* refs
+	return configureRefspec(dest)
 }
 
 // Checkout checks out the given ref.
@@ -381,21 +428,16 @@ func (g *Git) CheckConflicts(source, target string) ([]string, error) {
 	_, mergeErr := g.runMergeCheck("merge", "--no-commit", "--no-ff", source)
 
 	if mergeErr != nil {
-		// Check if there are unmerged files (indicates conflict)
-		conflicts, err := g.getConflictingFiles()
+		// ZFC: Use git's porcelain output to detect conflicts instead of parsing stderr.
+		// GetConflictingFiles() uses `git diff --diff-filter=U` which is the proper way.
+		conflicts, err := g.GetConflictingFiles()
 		if err == nil && len(conflicts) > 0 {
 			// Abort the test merge (best-effort cleanup)
 			_ = g.AbortMerge()
 			return conflicts, nil
 		}
 
-		// Check if it's a conflict error from wrapper
-		if errors.Is(mergeErr, ErrMergeConflict) {
-			_ = g.AbortMerge() // best-effort cleanup
-			return conflicts, nil
-		}
-
-		// Some other merge error (best-effort cleanup)
+		// No unmerged files detected - this is some other merge error
 		_ = g.AbortMerge()
 		return nil, mergeErr
 	}
@@ -407,7 +449,7 @@ func (g *Git) CheckConflicts(source, target string) ([]string, error) {
 }
 
 // runMergeCheck runs a git merge command and returns error info from both stdout and stderr.
-// This is needed because git merge outputs CONFLICT info to stdout.
+// ZFC: Returns GitError with raw output for agent observation.
 func (g *Git) runMergeCheck(args ...string) (string, error) {
 	cmd := exec.Command("git", args...)
 	cmd.Dir = g.workDir
@@ -418,20 +460,17 @@ func (g *Git) runMergeCheck(args ...string) (string, error) {
 
 	err := cmd.Run()
 	if err != nil {
-		// Check stdout for CONFLICT message (git sends it there)
-		stdoutStr := stdout.String()
-		if strings.Contains(stdoutStr, "CONFLICT") {
-			return "", ErrMergeConflict
-		}
-		// Fall back to stderr check
-		return "", g.wrapError(err, stderr.String(), args)
+		// ZFC: Return raw output for observation, don't interpret CONFLICT
+		return "", g.wrapError(err, stdout.String(), stderr.String(), args)
 	}
 
 	return strings.TrimSpace(stdout.String()), nil
 }
 
-// getConflictingFiles returns the list of files with merge conflicts.
-func (g *Git) getConflictingFiles() ([]string, error) {
+// GetConflictingFiles returns the list of files with merge conflicts.
+// ZFC: Uses git's porcelain output (diff --diff-filter=U) instead of parsing stderr.
+// This is the proper way to detect conflicts without violating ZFC.
+func (g *Git) GetConflictingFiles() ([]string, error) {
 	// git diff --name-only --diff-filter=U shows unmerged files
 	out, err := g.run("diff", "--name-only", "--diff-filter=U")
 	if err != nil {
@@ -553,35 +592,181 @@ func (g *Git) IsAncestor(ancestor, descendant string) (bool, error) {
 
 // WorktreeAdd creates a new worktree at the given path with a new branch.
 // The new branch is created from the current HEAD.
+// Sparse checkout is enabled to exclude .claude/ from source repos.
 func (g *Git) WorktreeAdd(path, branch string) error {
-	_, err := g.run("worktree", "add", "-b", branch, path)
-	return err
+	if _, err := g.run("worktree", "add", "-b", branch, path); err != nil {
+		return err
+	}
+	return ConfigureSparseCheckout(path)
 }
 
 // WorktreeAddFromRef creates a new worktree at the given path with a new branch
 // starting from the specified ref (e.g., "origin/main").
+// Sparse checkout is enabled to exclude .claude/ from source repos.
 func (g *Git) WorktreeAddFromRef(path, branch, startPoint string) error {
-	_, err := g.run("worktree", "add", "-b", branch, path, startPoint)
-	return err
+	if _, err := g.run("worktree", "add", "-b", branch, path, startPoint); err != nil {
+		return err
+	}
+	return ConfigureSparseCheckout(path)
 }
 
 // WorktreeAddDetached creates a new worktree at the given path with a detached HEAD.
+// Sparse checkout is enabled to exclude .claude/ from source repos.
 func (g *Git) WorktreeAddDetached(path, ref string) error {
-	_, err := g.run("worktree", "add", "--detach", path, ref)
-	return err
+	if _, err := g.run("worktree", "add", "--detach", path, ref); err != nil {
+		return err
+	}
+	return ConfigureSparseCheckout(path)
 }
 
 // WorktreeAddExisting creates a new worktree at the given path for an existing branch.
+// Sparse checkout is enabled to exclude .claude/ from source repos.
 func (g *Git) WorktreeAddExisting(path, branch string) error {
-	_, err := g.run("worktree", "add", path, branch)
-	return err
+	if _, err := g.run("worktree", "add", path, branch); err != nil {
+		return err
+	}
+	return ConfigureSparseCheckout(path)
 }
 
 // WorktreeAddExistingForce creates a new worktree even if the branch is already checked out elsewhere.
 // This is useful for cross-rig worktrees where multiple clones need to be on main.
+// Sparse checkout is enabled to exclude .claude/ from source repos.
 func (g *Git) WorktreeAddExistingForce(path, branch string) error {
-	_, err := g.run("worktree", "add", "--force", path, branch)
-	return err
+	if _, err := g.run("worktree", "add", "--force", path, branch); err != nil {
+		return err
+	}
+	return ConfigureSparseCheckout(path)
+}
+
+// ConfigureSparseCheckout sets up sparse checkout for a clone or worktree to exclude .claude/.
+// This ensures source repo settings don't override Gas Town agent settings.
+// Exported for use by doctor checks.
+func ConfigureSparseCheckout(repoPath string) error {
+	// Enable sparse checkout
+	cmd := exec.Command("git", "-C", repoPath, "config", "core.sparseCheckout", "true")
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("enabling sparse checkout: %s", strings.TrimSpace(stderr.String()))
+	}
+
+	// Get git dir for this repo/worktree
+	cmd = exec.Command("git", "-C", repoPath, "rev-parse", "--git-dir")
+	var stdout bytes.Buffer
+	cmd.Stdout = &stdout
+	stderr.Reset()
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("getting git dir: %s", strings.TrimSpace(stderr.String()))
+	}
+	gitDir := strings.TrimSpace(stdout.String())
+	if !filepath.IsAbs(gitDir) {
+		gitDir = filepath.Join(repoPath, gitDir)
+	}
+
+	// Write patterns directly to sparse-checkout file
+	// (git sparse-checkout set --stdin escapes the ! character incorrectly)
+	// Exclude all Claude Code context files to prevent source repo instructions
+	// from interfering with Gas Town agent context:
+	// - .claude/      : settings, rules, agents, commands
+	// - CLAUDE.md     : primary context file
+	// - CLAUDE.local.md : personal context file
+	// - .mcp.json     : MCP server configuration
+	infoDir := filepath.Join(gitDir, "info")
+	if err := os.MkdirAll(infoDir, 0755); err != nil {
+		return fmt.Errorf("creating info dir: %w", err)
+	}
+	sparseFile := filepath.Join(infoDir, "sparse-checkout")
+	sparsePatterns := "/*\n!/.claude/\n!/CLAUDE.md\n!/CLAUDE.local.md\n!/.mcp.json\n"
+	if err := os.WriteFile(sparseFile, []byte(sparsePatterns), 0644); err != nil {
+		return fmt.Errorf("writing sparse-checkout: %w", err)
+	}
+
+	// Check if HEAD exists (repo has commits) before running read-tree
+	// Empty repos (no commits) don't need read-tree and it would fail
+	checkHead := exec.Command("git", "-C", repoPath, "rev-parse", "--verify", "HEAD")
+	if err := checkHead.Run(); err != nil {
+		// No commits yet, sparse checkout config is set up for future use
+		return nil
+	}
+
+	// Reapply to remove excluded files
+	cmd = exec.Command("git", "-C", repoPath, "read-tree", "-mu", "HEAD")
+	stderr.Reset()
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("applying sparse checkout: %s", strings.TrimSpace(stderr.String()))
+	}
+	return nil
+}
+
+// ExcludedContextFiles lists all Claude context files that should be excluded by sparse checkout.
+var ExcludedContextFiles = []string{
+	".claude",
+	"CLAUDE.md",
+	"CLAUDE.local.md",
+	".mcp.json",
+}
+
+// CheckExcludedFilesExist checks if any Claude context files still exist in the repo
+// after sparse checkout was configured. These files should have been removed by
+// git read-tree, but may remain if they were untracked or modified.
+// Returns a list of files that still exist and should be manually removed.
+func CheckExcludedFilesExist(repoPath string) []string {
+	var remaining []string
+	for _, file := range ExcludedContextFiles {
+		path := filepath.Join(repoPath, file)
+		if _, err := os.Stat(path); err == nil {
+			remaining = append(remaining, file)
+		}
+	}
+	return remaining
+}
+
+// IsSparseCheckoutConfigured checks if sparse checkout is enabled and configured
+// to exclude Claude Code context files for a given repo/worktree.
+// Returns true only if both core.sparseCheckout is true AND the sparse-checkout
+// file contains all required exclusion patterns.
+func IsSparseCheckoutConfigured(repoPath string) bool {
+	// Check if core.sparseCheckout is true
+	cmd := exec.Command("git", "-C", repoPath, "config", "core.sparseCheckout")
+	output, err := cmd.Output()
+	if err != nil || strings.TrimSpace(string(output)) != "true" {
+		return false
+	}
+
+	// Get git dir for this repo/worktree
+	cmd = exec.Command("git", "-C", repoPath, "rev-parse", "--git-dir")
+	output, err = cmd.Output()
+	if err != nil {
+		return false
+	}
+	gitDir := strings.TrimSpace(string(output))
+	if !filepath.IsAbs(gitDir) {
+		gitDir = filepath.Join(repoPath, gitDir)
+	}
+
+	// Check if sparse-checkout file exists and excludes Claude context files
+	sparseFile := filepath.Join(gitDir, "info", "sparse-checkout")
+	content, err := os.ReadFile(sparseFile)
+	if err != nil {
+		return false
+	}
+
+	// Check for all required exclusion patterns
+	contentStr := string(content)
+	requiredPatterns := []string{
+		"!/.claude/",  // or legacy "!.claude/"
+		"!/CLAUDE.md", // or legacy without leading slash
+	}
+	for _, pattern := range requiredPatterns {
+		// Accept both with and without leading slash for backwards compatibility
+		legacyPattern := strings.TrimPrefix(pattern, "/")
+		if !strings.Contains(contentStr, pattern) && !strings.Contains(contentStr, legacyPattern) {
+			return false
+		}
+	}
+	return true
 }
 
 // WorktreeRemove removes a worktree.
@@ -871,7 +1056,8 @@ func (g *Git) BranchPushedToRemote(localBranch, remote string) (bool, int, error
 	// See: gt-cehl8 (gt done fails in worktrees due to missing origin tracking ref)
 	remoteRef := "refs/remotes/" + remoteBranch
 	if _, err := g.run("rev-parse", "--verify", remoteRef); err != nil {
-		// Remote ref doesn't exist locally - update it from FETCH_HEAD if fetch succeeded
+		// Remote ref doesn't exist locally - update it from FETCH_HEAD if fetch succeeded.
+		// Best-effort: if this fails, the code below falls back to ls-remote.
 		if fetchErr == nil {
 			_, _ = g.run("update-ref", remoteRef, "FETCH_HEAD")
 		}

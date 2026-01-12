@@ -11,6 +11,7 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/gastown/internal/beads"
+	"github.com/steveyegge/gastown/internal/constants"
 	"github.com/steveyegge/gastown/internal/git"
 	"github.com/steveyegge/gastown/internal/rig"
 	"github.com/steveyegge/gastown/internal/style"
@@ -32,7 +33,7 @@ func parseBranchName(branch string) branchInfo {
 	info := branchInfo{Branch: branch}
 
 	// Try polecat/<worker>/<issue> format
-	if strings.HasPrefix(branch, "polecat/") {
+	if strings.HasPrefix(branch, constants.BranchPolecatPrefix) {
 		parts := strings.SplitN(branch, "/", 3)
 		if len(parts) == 3 {
 			info.Worker = parts[1]
@@ -88,17 +89,6 @@ func runMqSubmit(cmd *cobra.Command, args []string) error {
 
 	if branch == defaultBranch || branch == "master" {
 		return fmt.Errorf("cannot submit %s/master branch to merge queue", defaultBranch)
-	}
-
-	// CRITICAL: Verify branch is pushed before creating MR bead
-	// This prevents work loss when MR is created but commits aren't on remote.
-	// See: gt-2hwi9 (Polecats not pushing before signaling done)
-	pushed, unpushedCount, err := g.BranchPushedToRemote(branch, "origin")
-	if err != nil {
-		return fmt.Errorf("checking if branch is pushed: %w", err)
-	}
-	if !pushed {
-		return fmt.Errorf("branch has %d unpushed commit(s); run 'git push -u origin %s' first", unpushedCount, branch)
 	}
 
 	// Parse branch info

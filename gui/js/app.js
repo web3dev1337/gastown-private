@@ -26,7 +26,6 @@ import { startOnboarding, shouldShowOnboarding, resetOnboarding } from './compon
 
 // DOM Elements
 const elements = {
-  loadingOverlay: document.getElementById('loading-overlay'),
   townName: document.getElementById('town-name'),
   connectionStatus: document.getElementById('connection-status'),
   mailBadge: document.getElementById('mail-badge'),
@@ -40,6 +39,9 @@ const elements = {
   mailList: document.getElementById('mail-list'),
   rigList: document.getElementById('rig-list'),
 };
+
+// Initialization guard to prevent double-init
+let isInitialized = false;
 
 // Loading state helpers
 function showLoadingState(container, message = 'Loading...') {
@@ -63,6 +65,13 @@ const views = document.querySelectorAll('.view');
 
 // Initialize application
 async function init() {
+  // Prevent double initialization
+  if (isInitialized) {
+    console.log('[App] Already initialized, skipping');
+    return;
+  }
+  isInitialized = true;
+
   console.log('[App] Initializing Gas Town GUI...');
 
   // Set up navigation
@@ -274,6 +283,35 @@ function handleWebSocketMessage(message) {
       }
       break;
 
+    case 'mayor_message':
+      // Mayor message sent - add to activity feed
+      state.addEvent({
+        id: message.data.id,
+        type: 'mayor_message',
+        timestamp: message.data.timestamp,
+        target: message.data.target,
+        message: message.data.message,
+        status: message.data.status,
+        response: message.data.response
+      });
+      break;
+
+    case 'service_started':
+      // Service started (possibly Mayor auto-started)
+      if (message.data?.autoStarted) {
+        showToast(`${message.data.service} auto-started`, 'success');
+        state.addEvent({
+          id: Date.now().toString(36),
+          type: 'mayor_started',
+          timestamp: new Date().toISOString(),
+          autoStarted: true,
+          service: message.data.service
+        });
+      }
+      // Refresh status and update state to re-render sidebar
+      api.getStatus().then(status => state.setStatus(status)).catch(console.error);
+      break;
+
     default:
       console.log('[WS] Unknown message type:', message.type);
   }
@@ -298,20 +336,33 @@ async function loadInitialData() {
   elements.statusMessage.textContent = 'Loading...';
 
   try {
-    // Load status
-    const status = await api.getStatus();
-    state.setStatus(status);
+    // Load all critical data in parallel using Promise.allSettled
+    // This way a slow/failing request doesn't block others
+    const results = await Promise.allSettled([
+      api.getStatus().then(status => {
+        state.setStatus(status);
+        return status;
+      }),
+      loadConvoys(),
+      loadMayorMessageHistory(),
+      loadDashboard(),
+    ]);
 
-    // Load convoys
-    await loadConvoys();
+    // Check results and log any failures
+    const labels = ['status', 'convoys', 'mayor history', 'dashboard'];
+    results.forEach((result, i) => {
+      if (result.status === 'rejected') {
+        console.error(`[App] Failed to load ${labels[i]}:`, result.reason);
+      }
+    });
 
-    // Load dashboard (default view)
-    await loadDashboard();
-
-    elements.statusMessage.textContent = 'Ready';
-
-    // Hide loading overlay
-    hideLoadingOverlay();
+    // If status failed, show warning
+    if (results[0].status === 'rejected') {
+      elements.statusMessage.textContent = 'Ready (status unavailable)';
+      showToast('Some data failed to load', 'warning');
+    } else {
+      elements.statusMessage.textContent = 'Ready';
+    }
 
     // Background preload of other data (don't await, let it load in background)
     preloadBackgroundData();
@@ -319,20 +370,6 @@ async function loadInitialData() {
     console.error('[App] Failed to load initial data:', err);
     elements.statusMessage.textContent = 'Error loading data';
     showToast('Failed to load data', 'error');
-
-    // Hide loading overlay even on error
-    hideLoadingOverlay();
-  }
-}
-
-// Hide the loading overlay
-function hideLoadingOverlay() {
-  if (elements.loadingOverlay) {
-    elements.loadingOverlay.classList.add('hidden');
-    // Remove from DOM after transition
-    setTimeout(() => {
-      elements.loadingOverlay.style.display = 'none';
-    }, 300);
   }
 }
 
@@ -377,6 +414,30 @@ async function loadConvoys() {
         <p>Failed to load convoys</p>
       </div>
     `;
+  }
+}
+
+// Load Mayor message history and add to activity feed
+async function loadMayorMessageHistory() {
+  try {
+    const messages = await api.getMayorMessages(20);
+    if (messages && messages.length > 0) {
+      // Add messages to activity feed (oldest first so newest appear at top)
+      for (const msg of messages.reverse()) {
+        state.addEvent({
+          id: msg.id,
+          type: 'mayor_message',
+          timestamp: msg.timestamp,
+          target: msg.target,
+          message: msg.message,
+          status: msg.status,
+          response: msg.response
+        });
+      }
+      console.log(`[App] Loaded ${messages.length} Mayor messages into activity feed`);
+    }
+  } catch (err) {
+    console.log('[App] No Mayor message history (may be first run):', err.message);
   }
 }
 
@@ -854,6 +915,131 @@ function setupThemeToggle() {
 document.getElementById('refresh-btn').addEventListener('click', () => {
   loadInitialData();
   showToast('Refreshing...', 'info', 1000);
+});
+
+// Mayor command bar
+const mayorInput = document.getElementById('mayor-command-input');
+const mayorSendBtn = document.getElementById('mayor-command-send');
+
+async function sendToMayor() {
+  const message = mayorInput.value.trim();
+  if (!message) return;
+
+  mayorSendBtn.disabled = true;
+  mayorSendBtn.innerHTML = '<span class="material-icons spinning">sync</span>';
+
+  try {
+    const result = await api.nudge('mayor', message);
+    if (result.success) {
+      const truncatedMsg = message.substring(0, 40) + (message.length > 40 ? '...' : '');
+      if (result.wasAutoStarted) {
+        showToast('Mayor auto-started. Sent: ' + truncatedMsg, 'success');
+      } else {
+        showToast('Sent to Mayor: ' + truncatedMsg, 'success');
+      }
+      mayorInput.value = '';
+      // Auto-open Mayor output panel so user can see what's happening
+      showMayorOutput();
+    } else {
+      showToast('Failed: ' + (result.error || 'Unknown error'), 'error');
+    }
+  } catch (err) {
+    showToast('Error: ' + err.message, 'error');
+  } finally {
+    mayorSendBtn.disabled = false;
+    mayorSendBtn.innerHTML = '<span class="material-icons">send</span>';
+  }
+}
+
+mayorSendBtn.addEventListener('click', sendToMayor);
+mayorInput.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter' && !e.shiftKey) {
+    e.preventDefault();
+    sendToMayor();
+  }
+});
+
+// Mayor output panel
+const mayorViewBtn = document.getElementById('mayor-view-btn');
+const mayorOutputPanel = document.getElementById('mayor-output-panel');
+const mayorOutputContent = document.getElementById('mayor-output-content');
+const mayorOutputClose = document.getElementById('mayor-output-close');
+let mayorOutputRefreshInterval = null;
+
+async function refreshMayorOutput() {
+  try {
+    const data = await api.getMayorOutput(80);
+    if (data.output) {
+      // Format output with some highlighting
+      let output = data.output;
+      // Highlight key phrases
+      output = output.replace(/(Done\.|Success|Created|Complete)/gi, '<span style="color: #22c55e">$1</span>');
+      output = output.replace(/(Error|Failed|Cannot)/gi, '<span style="color: #ef4444">$1</span>');
+      output = output.replace(/(Thinking…|Working|Processing)/gi, '<span style="color: #f59e0b">$1</span>');
+      output = output.replace(/(https?:\/\/[^\s]+)/g, '<a href="$1" target="_blank" style="color: #3b82f6">$1</a>');
+      mayorOutputContent.innerHTML = `<pre>${output}</pre>`;
+      // Scroll to bottom
+      mayorOutputContent.scrollTop = mayorOutputContent.scrollHeight;
+    } else {
+      mayorOutputContent.innerHTML = `<pre style="color: var(--text-tertiary)">${data.running ? 'Mayor is running but no output yet...' : 'Mayor is not running. Send a message to auto-start.'}</pre>`;
+    }
+  } catch (err) {
+    mayorOutputContent.innerHTML = `<pre style="color: #ef4444">Error loading output: ${err.message}</pre>`;
+  }
+}
+
+function showMayorOutput() {
+  mayorOutputPanel.style.display = 'block';
+  refreshMayorOutput();
+  // Auto-refresh every 2 seconds while open
+  mayorOutputRefreshInterval = setInterval(refreshMayorOutput, 2000);
+}
+
+function hideMayorOutput() {
+  mayorOutputPanel.style.display = 'none';
+  if (mayorOutputRefreshInterval) {
+    clearInterval(mayorOutputRefreshInterval);
+    mayorOutputRefreshInterval = null;
+  }
+}
+
+mayorViewBtn.addEventListener('click', () => {
+  if (mayorOutputPanel.style.display === 'none') {
+    showMayorOutput();
+  } else {
+    hideMayorOutput();
+  }
+});
+
+mayorOutputClose.addEventListener('click', hideMayorOutput);
+
+// Make panel draggable by header
+const mayorOutputHeader = document.querySelector('.mayor-output-header');
+let isDragging = false;
+let dragOffsetX = 0;
+let dragOffsetY = 0;
+
+mayorOutputHeader.addEventListener('mousedown', (e) => {
+  if (e.target.closest('.mayor-output-close')) return; // Don't drag when clicking close
+  isDragging = true;
+  const rect = mayorOutputPanel.getBoundingClientRect();
+  dragOffsetX = e.clientX - rect.left;
+  dragOffsetY = e.clientY - rect.top;
+  mayorOutputPanel.style.transform = 'none'; // Remove centering transform
+  mayorOutputPanel.style.left = rect.left + 'px';
+  mayorOutputPanel.style.top = rect.top + 'px';
+});
+
+document.addEventListener('mousemove', (e) => {
+  if (!isDragging) return;
+  const x = Math.max(0, Math.min(window.innerWidth - 100, e.clientX - dragOffsetX));
+  const y = Math.max(0, Math.min(window.innerHeight - 50, e.clientY - dragOffsetY));
+  mayorOutputPanel.style.left = x + 'px';
+  mayorOutputPanel.style.top = y + 'px';
+});
+
+document.addEventListener('mouseup', () => {
+  isDragging = false;
 });
 
 // Initialize on DOM ready

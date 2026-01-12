@@ -11,6 +11,7 @@ import (
 	"github.com/steveyegge/gastown/internal/events"
 	"github.com/steveyegge/gastown/internal/git"
 	"github.com/steveyegge/gastown/internal/mail"
+	"github.com/steveyegge/gastown/internal/polecat"
 	"github.com/steveyegge/gastown/internal/rig"
 	"github.com/steveyegge/gastown/internal/style"
 	"github.com/steveyegge/gastown/internal/workspace"
@@ -57,6 +58,7 @@ var (
 	doneExit          bool
 	donePhaseComplete bool
 	doneGate          string
+	doneCleanupStatus string
 )
 
 // Valid exit types for gt done
@@ -74,6 +76,7 @@ func init() {
 	doneCmd.Flags().BoolVar(&doneExit, "exit", false, "Exit Claude session after MR submission (self-terminate)")
 	doneCmd.Flags().BoolVar(&donePhaseComplete, "phase-complete", false, "Signal phase complete - await gate before continuing")
 	doneCmd.Flags().StringVar(&doneGate, "gate", "", "Gate bead ID to wait on (with --phase-complete)")
+	doneCmd.Flags().StringVar(&doneCleanupStatus, "cleanup-status", "", "Git cleanup status: clean, uncommitted, unpushed, stash, unknown (ZFC: agent-observed)")
 
 	rootCmd.AddCommand(doneCmd)
 }
@@ -161,17 +164,6 @@ func runDone(cmd *cobra.Command, args []string) error {
 		if branch == defaultBranch || branch == "master" {
 			return fmt.Errorf("cannot submit %s/master branch to merge queue", defaultBranch)
 		}
-
-		// Check for unpushed commits - branch must be pushed before MR creation
-		// Use BranchPushedToRemote which handles polecat branches without upstream tracking
-		pushed, unpushedCount, err := g.BranchPushedToRemote(branch, "origin")
-		if err != nil {
-			return fmt.Errorf("checking if branch is pushed: %w", err)
-		}
-		if !pushed {
-			return fmt.Errorf("branch has %d unpushed commit(s); run 'git push -u origin %s' first", unpushedCount, branch)
-		}
-
 		// Check that branch has commits ahead of default branch (prevents submitting stale branches)
 		aheadCount, err := g.CommitsAhead(defaultBranch, branch)
 		if err != nil {
@@ -366,12 +358,10 @@ func runDone(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-// updateAgentStateOnDone updates the agent bead state when work is complete.
-// Maps exit type to agent state:
-//   - COMPLETED → "done"
-//   - ESCALATED → "stuck"
-//   - DEFERRED → "idle"
-//   - PHASE_COMPLETE → "awaiting-gate"
+// updateAgentStateOnDone clears the agent's hook and reports cleanup status.
+// Per gt-zecmc: observable states ("done", "idle") removed - use tmux to discover.
+// Non-observable states ("stuck", "awaiting-gate") are still set since they represent
+// intentional agent decisions that can't be observed from tmux.
 //
 // Also self-reports cleanup_status for ZFC compliance (#10).
 func updateAgentStateOnDone(cwd, townRoot, exitType, _ string) { // issueID unused but kept for future audit logging
@@ -394,22 +384,6 @@ func updateAgentStateOnDone(cwd, townRoot, exitType, _ string) { // issueID unus
 		return
 	}
 
-	// Map exit type to agent state
-	var newState string
-	switch exitType {
-	case ExitCompleted:
-		newState = "done"
-	case ExitEscalated:
-		newState = "stuck"
-	case ExitDeferred:
-		newState = "idle"
-	case ExitPhaseComplete:
-		newState = "awaiting-gate"
-	default:
-		return
-	}
-
-	// Update agent bead with new state and clear hook_bead (work is done)
 	// Use rig path for slot commands - bd slot doesn't route from town root
 	var beadsPath string
 	switch ctx.Role {
@@ -419,21 +393,51 @@ func updateAgentStateOnDone(cwd, townRoot, exitType, _ string) { // issueID unus
 		beadsPath = filepath.Join(townRoot, ctx.Rig)
 	}
 	bd := beads.New(beadsPath)
-	emptyHook := ""
-	if err := bd.UpdateAgentState(agentBeadID, newState, &emptyHook); err != nil {
-		// Log warning instead of silent ignore - helps debug cross-beads issues
-		fmt.Fprintf(os.Stderr, "Warning: couldn't update agent %s state on done: %v\n", agentBeadID, err)
-		return
+
+	// BUG FIX (gt-vwjz6): Close hooked beads before clearing the hook.
+	// Previously, the agent's hook_bead slot was cleared but the hooked bead itself
+	// stayed status=hooked forever. Now we close the hooked bead before clearing.
+	if agentBead, err := bd.Show(agentBeadID); err == nil && agentBead.HookBead != "" {
+		hookedBeadID := agentBead.HookBead
+		// Only close if the hooked bead exists and is still in "hooked" status
+		if hookedBead, err := bd.Show(hookedBeadID); err == nil && hookedBead.Status == beads.StatusHooked {
+			if err := bd.Close(hookedBeadID); err != nil {
+				fmt.Fprintf(os.Stderr, "Warning: couldn't close hooked bead %s: %v\n", hookedBeadID, err)
+			}
+		}
+	}
+
+	// Clear the hook (work is done) - gt-zecmc
+	if err := bd.ClearHookBead(agentBeadID); err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: couldn't clear agent %s hook: %v\n", agentBeadID, err)
+	}
+
+	// Only set non-observable states - "stuck" and "awaiting-gate" are intentional
+	// agent decisions that can't be discovered from tmux. Skip "done" and "idle"
+	// since those are observable (no session = done, session + no hook = idle).
+	switch exitType {
+	case ExitEscalated:
+		// "stuck" = agent is requesting help - not observable from tmux
+		if _, err := bd.Run("agent", "state", agentBeadID, "stuck"); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: couldn't set agent %s to stuck: %v\n", agentBeadID, err)
+		}
+	case ExitPhaseComplete:
+		// "awaiting-gate" = agent is waiting for external trigger - not observable
+		if _, err := bd.Run("agent", "state", agentBeadID, "awaiting-gate"); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: couldn't set agent %s to awaiting-gate: %v\n", agentBeadID, err)
+		}
+	// ExitCompleted and ExitDeferred don't set state - observable from tmux
 	}
 
 	// ZFC #10: Self-report cleanup status
-	// Compute git state and report so Witness can decide removal safety
-	cleanupStatus := computeCleanupStatus(cwd)
-	if cleanupStatus != "" {
-		if err := bd.UpdateAgentCleanupStatus(agentBeadID, cleanupStatus); err != nil {
-			// Log warning instead of silent ignore
-			fmt.Fprintf(os.Stderr, "Warning: couldn't update agent %s cleanup status: %v\n", agentBeadID, err)
-			return
+	// Agent observes git state and passes cleanup status via --cleanup-status flag
+	if doneCleanupStatus != "" {
+		cleanupStatus := parseCleanupStatus(doneCleanupStatus)
+		if cleanupStatus != polecat.CleanupUnknown {
+			if err := bd.UpdateAgentCleanupStatus(agentBeadID, string(cleanupStatus)); err != nil {
+				fmt.Fprintf(os.Stderr, "Warning: couldn't update agent %s cleanup status: %v\n", agentBeadID, err)
+				return
+			}
 		}
 	}
 }
@@ -459,25 +463,19 @@ func getDispatcherFromBead(cwd, issueID string) string {
 	return fields.DispatchedBy
 }
 
-// computeCleanupStatus checks git state and returns the cleanup status.
-// Returns the most critical issue: has_unpushed > has_stash > has_uncommitted > clean
-func computeCleanupStatus(cwd string) string {
-	g := git.NewGit(cwd)
-	status, err := g.CheckUncommittedWork()
-	if err != nil {
-		// If we can't check, report unknown - Witness should be cautious
-		return "unknown"
+// parseCleanupStatus converts a string flag value to a CleanupStatus.
+// ZFC: Agent observes git state and passes the appropriate status.
+func parseCleanupStatus(s string) polecat.CleanupStatus {
+	switch strings.ToLower(s) {
+	case "clean":
+		return polecat.CleanupClean
+	case "uncommitted", "has_uncommitted":
+		return polecat.CleanupUncommitted
+	case "stash", "has_stash":
+		return polecat.CleanupStash
+	case "unpushed", "has_unpushed":
+		return polecat.CleanupUnpushed
+	default:
+		return polecat.CleanupUnknown
 	}
-
-	// Check in priority order (most critical first)
-	if status.UnpushedCommits > 0 {
-		return "has_unpushed"
-	}
-	if status.StashCount > 0 {
-		return "has_stash"
-	}
-	if status.HasUncommittedChanges {
-		return "has_uncommitted"
-	}
-	return "clean"
 }

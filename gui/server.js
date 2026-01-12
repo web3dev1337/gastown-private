@@ -155,9 +155,21 @@ app.use(cors({
 app.use(express.json({ limit: '1mb' }));
 app.use('/assets', express.static(path.join(__dirname, 'assets')));
 app.use('/css', express.static(path.join(__dirname, 'css')));
-app.use('/js', express.static(path.join(__dirname, 'js')));
+// Add cache-control headers for JS files to improve load times
+app.use('/js', express.static(path.join(__dirname, 'js'), {
+  maxAge: '1h',
+  setHeaders: (res, filePath) => {
+    // Set cache-control for JS files
+    if (filePath.endsWith('.js')) {
+      res.setHeader('Cache-Control', 'public, max-age=3600');
+    }
+  }
+}));
 app.get('/', (req, res) => {
   res.sendFile(path.join(__dirname, 'index.html'));
+});
+app.get('/favicon.ico', (req, res) => {
+  res.sendFile(path.join(__dirname, 'assets', 'favicon.ico'));
 });
 
 // Store connected WebSocket clients
@@ -200,6 +212,38 @@ function validateRigAndName(req, res) {
   return true;
 }
 
+// Check if a specific tmux session is running
+async function isSessionRunning(sessionName) {
+  try {
+    const { stdout } = await execFileAsync('tmux', ['has-session', '-t', sessionName]);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// Mayor message history (in-memory, last 100 messages)
+const mayorMessageHistory = [];
+const MAX_MESSAGE_HISTORY = 100;
+
+function addMayorMessage(target, message, status, response = null) {
+  const entry = {
+    id: Date.now().toString(36) + Math.random().toString(36).substr(2, 5),
+    timestamp: new Date().toISOString(),
+    target,
+    message,
+    status, // 'sent', 'failed', 'auto-started'
+    response
+  };
+  mayorMessageHistory.unshift(entry);
+  if (mayorMessageHistory.length > MAX_MESSAGE_HISTORY) {
+    mayorMessageHistory.pop();
+  }
+  // Broadcast to connected clients
+  broadcast({ type: 'mayor_message', data: entry });
+  return entry;
+}
+
 // Get running tmux sessions for polecats
 async function getRunningPolecats() {
   try {
@@ -222,6 +266,49 @@ async function getRunningPolecats() {
   } catch {
     return new Set();
   }
+}
+
+// Parse GitHub URL to extract owner/repo
+function parseGitHubUrl(url) {
+  if (!url) return null;
+
+  // Handle various GitHub URL formats:
+  // https://github.com/owner/repo
+  // https://github.com/owner/repo.git
+  // git@github.com:owner/repo.git
+  // ssh://git@github.com/owner/repo.git
+
+  let match = url.match(/github\.com[/:]([^/]+)\/([^/.\s]+)/);
+  if (match) {
+    return { owner: match[1], repo: match[2].replace(/\.git$/, '') };
+  }
+  return null;
+}
+
+// Get default branch for a GitHub repo
+async function getDefaultBranch(url) {
+  const parsed = parseGitHubUrl(url);
+  if (!parsed) {
+    console.log(`[GitHub] Could not parse URL: ${url}`);
+    return null;
+  }
+
+  try {
+    // Use gh api to get repo info including default branch
+    const { stdout } = await execFileAsync('gh', [
+      'api', `repos/${parsed.owner}/${parsed.repo}`, '--jq', '.default_branch'
+    ], { timeout: 10000 });
+
+    const branch = String(stdout || '').trim();
+    if (branch) {
+      console.log(`[GitHub] Detected default branch for ${parsed.owner}/${parsed.repo}: ${branch}`);
+      return branch;
+    }
+  } catch (err) {
+    console.warn(`[GitHub] Could not detect default branch for ${url}:`, err.message);
+  }
+
+  return null;
 }
 
 // Get polecat output from tmux (last N lines)
@@ -260,14 +347,20 @@ async function executeGT(args, options = {}) {
     const output = String(error.stdout || '') + '\n' + String(error.stderr || '');
     const trimmedOutput = output.trim();
 
-    // Commands like 'gt doctor' exit with code 1 when issues found, but still have useful output
-    if (trimmedOutput) {
-      console.warn(`[GT] Command exited with error but has output: ${error.message}`);
-      if (trimmedOutput) console.warn(`[GT] Output:\n${trimmedOutput}`);
+    // Check if this looks like a real error (contains "Error:" or "error:")
+    const looksLikeError = /\bError:/i.test(trimmedOutput) || error.code !== 0;
+
+    // Commands like 'gt doctor' or 'gt status' exit with code 1 when issues found, but still have useful output
+    // However, if output contains "Error:" it's a real error, not just informational
+    if (trimmedOutput && !looksLikeError) {
+      console.warn(`[GT] Command exited with non-zero but has output: ${error.message}`);
+      console.warn(`[GT] Output:\n${trimmedOutput}`);
       return { success: true, data: trimmedOutput, exitCode: error.code };
     }
+
     console.error(`[GT] Error: ${error.message}`);
-    return { success: false, error: error.message };
+    if (trimmedOutput) console.error(`[GT] Output:\n${trimmedOutput}`);
+    return { success: false, error: trimmedOutput || error.message, exitCode: error.code };
   }
 }
 
@@ -755,6 +848,92 @@ app.post('/api/mail/:id/unread', async (req, res) => {
   }
 });
 
+// ============= Nudge API =============
+
+// Send a message to Mayor (or other agent)
+app.post('/api/nudge', async (req, res) => {
+  const { target, message, autoStart = true } = req.body;
+
+  if (!message) {
+    return res.status(400).json({ error: 'Message is required' });
+  }
+
+  // Default to mayor if no target specified
+  const nudgeTarget = target || 'mayor';
+  const sessionName = `gt-${nudgeTarget}`;
+
+  try {
+    // Check if target session is running
+    const isRunning = await isSessionRunning(sessionName);
+    let wasAutoStarted = false;
+
+    if (!isRunning) {
+      console.log(`[Nudge] Session ${sessionName} not running`);
+
+      // Auto-start Mayor if requested
+      if (nudgeTarget === 'mayor' && autoStart) {
+        console.log(`[Nudge] Auto-starting Mayor...`);
+        const startResult = await executeGT(['mayor', 'start'], { timeout: 30000 });
+
+        if (!startResult.success) {
+          const entry = addMayorMessage(nudgeTarget, message, 'failed', 'Failed to auto-start Mayor');
+          return res.status(500).json({
+            error: 'Mayor not running and failed to auto-start',
+            details: startResult.error,
+            messageId: entry.id
+          });
+        }
+
+        wasAutoStarted = true;
+        console.log(`[Nudge] Mayor auto-started successfully`);
+
+        // Wait a moment for Mayor to initialize
+        await new Promise(resolve => setTimeout(resolve, 2000));
+
+        // Broadcast that Mayor was started
+        broadcast({ type: 'service_started', data: { service: 'mayor', autoStarted: true } });
+      } else if (!isRunning) {
+        const entry = addMayorMessage(nudgeTarget, message, 'failed', `Session ${sessionName} not running`);
+        return res.status(400).json({
+          error: `${nudgeTarget} is not running`,
+          hint: nudgeTarget === 'mayor' ? 'Set autoStart: true to start Mayor automatically' : `Start the ${nudgeTarget} service first`,
+          messageId: entry.id
+        });
+      }
+    }
+
+    // Send the nudge
+    const result = await executeGT(['nudge', nudgeTarget, message], { timeout: 10000 });
+
+    if (result.success) {
+      const status = wasAutoStarted ? 'auto-started' : 'sent';
+      const entry = addMayorMessage(nudgeTarget, message, status);
+      res.json({
+        success: true,
+        target: nudgeTarget,
+        message,
+        wasAutoStarted,
+        messageId: entry.id
+      });
+    } else {
+      const entry = addMayorMessage(nudgeTarget, message, 'failed', result.error);
+      res.status(500).json({
+        error: result.error || 'Failed to send message',
+        messageId: entry.id
+      });
+    }
+  } catch (err) {
+    const entry = addMayorMessage(nudgeTarget, message, 'failed', err.message);
+    res.status(500).json({ error: err.message, messageId: entry.id });
+  }
+});
+
+// Get Mayor message history
+app.get('/api/mayor/messages', (req, res) => {
+  const limit = Math.min(parseInt(req.query.limit) || 50, MAX_MESSAGE_HISTORY);
+  res.json(mayorMessageHistory.slice(0, limit));
+});
+
 // ============= Beads API =============
 
 // Create a new bead (issue)
@@ -1039,17 +1218,6 @@ app.get('/api/bead/:beadId/links', async (req, res) => {
   }
 });
 
-// Nudge agent
-app.post('/api/nudge', async (req, res) => {
-  const { target, message } = req.body;
-  const result = await executeGT(['nudge', target, '-m', message]);
-  if (result.success) {
-    res.json({ success: true });
-  } else {
-    res.status(500).json({ error: result.error });
-  }
-});
-
 // Get agent list
 app.get('/api/agents', async (req, res) => {
   // Check cache
@@ -1094,6 +1262,31 @@ app.get('/api/agents', async (req, res) => {
     res.json(response);
   } else {
     res.status(500).json({ error: result.error });
+  }
+});
+
+// Get Mayor output (tmux buffer)
+app.get('/api/mayor/output', async (req, res) => {
+  const lines = parseInt(req.query.lines) || 100;
+  const sessionName = 'gt-mayor';
+
+  try {
+    const output = await getPolecatOutput(sessionName, lines);
+    const isRunning = await isSessionRunning(sessionName);
+
+    if (output !== null) {
+      res.json({
+        session: sessionName,
+        output,
+        running: isRunning,
+        // Include recent messages sent to Mayor for context
+        recentMessages: mayorMessageHistory.slice(0, 10)
+      });
+    } else {
+      res.json({ session: sessionName, output: null, running: isRunning, recentMessages: [] });
+    }
+  } catch (err) {
+    res.status(500).json({ error: err.message });
   }
 });
 
@@ -1345,7 +1538,15 @@ app.post('/api/rigs', async (req, res) => {
     return res.status(400).json({ error: 'Name and URL are required' });
   }
 
+  // Detect default branch from GitHub API (handles main vs master)
+  // NOTE: --branch flag requires gt to be rebuilt from source (not in current binary)
+  const defaultBranch = await getDefaultBranch(url);
+  if (defaultBranch) {
+    console.log(`[Rig] Detected default branch: ${defaultBranch} (gt --branch flag pending rebuild)`);
+  }
+
   // Rig operations can take 90+ seconds for large repos
+  // TODO: Pass --branch when gt is rebuilt: ['rig', 'add', name, url, '--branch', defaultBranch]
   const result = await executeGT(['rig', 'add', name, url], { timeout: 120000 });
 
   // Check if rig add actually succeeded (not just "has output")
@@ -1550,7 +1751,7 @@ app.post('/api/service/:name/up', async (req, res) => {
   console.log(`[Service] Starting ${name}...`);
 
   try {
-    const result = await executeGT([name, 'up'], { timeout: 30000 });
+    const result = await executeGT([name, 'start'], { timeout: 30000 });
 
     if (result.success) {
       broadcast({ type: 'service_started', data: { service: name } });
@@ -1621,7 +1822,7 @@ app.post('/api/service/:name/restart', async (req, res) => {
     await new Promise(resolve => setTimeout(resolve, 1000));
 
     // Start
-    const result = await executeGT([name, 'up'], { timeout: 30000 });
+    const result = await executeGT([name, 'start'], { timeout: 30000 });
 
     if (result.success) {
       broadcast({ type: 'service_restarted', data: { service: name } });
@@ -2036,7 +2237,8 @@ function startActivityStream() {
 
   console.log('[WS] Starting activity stream...');
 
-  activityProcess = spawn('bd', ['activity', '--follow'], {
+  // Use gt feed for comprehensive activity (beads + gt events + convoys)
+  activityProcess = spawn('gt', ['feed', '--plain', '--follow'], {
     cwd: GT_ROOT
   });
 
@@ -2064,30 +2266,43 @@ function startActivityStream() {
   });
 }
 
-// Parse activity line from bd activity output
-// Format: [HH:MM:SS] SYMBOL BEAD_ID action · description
+// Parse activity line from gt feed output
+// Format: [HH:MM:SS] SYMBOL TARGET action · description
 function parseActivityLine(line) {
-  const match = line.match(/^\[(\d{2}:\d{2}:\d{2})\]\s+([+\u2192\u2713\u2717\u2298\ud83d\udccc])\s+(\S+)\s+(.+)$/u);
+  // Match various unicode symbols used by gt feed
+  const match = line.match(/^\[(\d{2}:\d{2}:\d{2})\]\s+(.+?)\s+(\S+)\s+(.+)$/u);
   if (!match) return null;
 
   const [, time, symbol, target, rest] = match;
   const [action, ...descParts] = rest.split(' · ');
 
+  // Map symbols to event types (beads + gt events)
   const typeMap = {
-    '+': 'create',
-    '\u2192': 'update',   // →
-    '\u2713': 'complete', // ✓
-    '\u2717': 'fail',     // ✗
-    '\u2298': 'delete',   // ⊘
-    '\ud83d\udccc': 'pin' // 📌
+    '+': 'bead_created',
+    '→': 'bead_updated',
+    '✓': 'work_complete',
+    '✗': 'work_failed',
+    '⊘': 'bead_deleted',
+    '📌': 'bead_pinned',
+    '🦉': 'patrol_started',
+    '⚡': 'agent_nudged',
+    '🎯': 'work_slung',
+    '🤝': 'handoff',
+    '⚙': 'merge_started',
+    '🚀': 'convoy_created',
+    '📦': 'convoy_updated',
   };
 
+  const eventType = typeMap[symbol.trim()] || 'system';
+
   return {
+    id: `${Date.now()}-${Math.random().toString(36).substr(2, 5)}`,
     time,
-    type: typeMap[symbol] || 'unknown',
+    type: eventType,
     target,
     action: action.trim(),
     message: descParts.join(' · ').trim(),
+    summary: `${action.trim()}${descParts.length ? ': ' + descParts.join(' · ').trim() : ''}`,
     timestamp: new Date().toISOString()
   };
 }

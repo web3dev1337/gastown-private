@@ -9,6 +9,7 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/gastown/internal/config"
+	"github.com/steveyegge/gastown/internal/constants"
 	"github.com/steveyegge/gastown/internal/events"
 	"github.com/steveyegge/gastown/internal/session"
 	"github.com/steveyegge/gastown/internal/style"
@@ -182,24 +183,24 @@ func runHandoff(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	// Report agent state as stopped (ZFC: agents self-report state)
-	cwd, _ := os.Getwd()
-	if townRoot, _ := workspace.FindFromCwd(); townRoot != "" {
-		if roleInfo, err := GetRoleWithContext(cwd, townRoot); err == nil {
-			reportAgentState(RoleContext{
-				Role:     roleInfo.Role,
-				Rig:      roleInfo.Rig,
-				Polecat:  roleInfo.Polecat,
-				TownRoot: townRoot,
-				WorkDir:  cwd,
-			}, "stopped")
-		}
-	}
+	// NOTE: reportAgentState("stopped") removed (gt-zecmc)
+	// Agent liveness is observable from tmux - no need to record it in bead.
+	// "Discover, don't track" principle: reality is truth, state is derived.
 
 	// Clear scrollback history before respawn (resets copy-mode from [0/N] to [0/0])
 	if err := t.ClearHistory(pane); err != nil {
 		// Non-fatal - continue with respawn even if clear fails
 		style.PrintWarning("could not clear history: %v", err)
+	}
+
+	// Write handoff marker for successor detection (prevents handoff loop bug).
+	// The marker is cleared by gt prime after it outputs the warning.
+	// This tells the new session "you're post-handoff, don't re-run /handoff"
+	if cwd, err := os.Getwd(); err == nil {
+		runtimeDir := filepath.Join(cwd, constants.DirRuntime)
+		_ = os.MkdirAll(runtimeDir, 0755)
+		markerPath := filepath.Join(runtimeDir, constants.FileHandoffMarker)
+		_ = os.WriteFile(markerPath, []byte(currentSession), 0644)
 	}
 
 	// Use exec to respawn the pane - this kills us and restarts
@@ -323,6 +324,17 @@ func resolvePathToSession(path string) (string, error) {
 	return "", fmt.Errorf("cannot parse path '%s' - expected <rig>/<polecat>, <rig>/crew/<name>, <rig>/witness, or <rig>/refinery", path)
 }
 
+// claudeEnvVars lists the Claude-related environment variables to propagate
+// during handoff. These vars aren't inherited by tmux respawn-pane's fresh shell.
+var claudeEnvVars = []string{
+	// Claude API and config
+	"ANTHROPIC_API_KEY",
+	"CLAUDE_CODE_USE_BEDROCK",
+	// AWS vars for Bedrock
+	"AWS_PROFILE",
+	"AWS_REGION",
+}
+
 // buildRestartCommand creates the command to run when respawning a session's pane.
 // This needs to be the actual command to execute (e.g., claude), not a session attach command.
 // The command includes a cd to the correct working directory for the role.
@@ -339,20 +351,52 @@ func buildRestartCommand(sessionName string) (string, error) {
 		return "", err
 	}
 
-	// Determine GT_ROLE and BD_ACTOR values for this session
-	gtRole := sessionToGTRole(sessionName)
+	// Parse the session name to get the identity (used for GT_ROLE and beacon)
+	identity, err := session.ParseSessionName(sessionName)
+	if err != nil {
+		return "", fmt.Errorf("cannot parse session name %q: %w", sessionName, err)
+	}
+	gtRole := identity.GTRole()
+
+	// Build startup beacon for predecessor discovery via /resume
+	// Use FormatStartupNudge instead of bare "gt prime" which confuses agents
+	// The SessionStart hook handles context injection (gt prime --hook)
+	beacon := session.FormatStartupNudge(session.StartupNudgeConfig{
+		Recipient: identity.Address(),
+		Sender:    "self",
+		Topic:     "handoff",
+	})
 
 	// For respawn-pane, we:
 	// 1. cd to the right directory (role's canonical home)
 	// 2. export GT_ROLE and BD_ACTOR so role detection works correctly
-	// 3. run claude with "gt prime" as initial prompt (triggers GUPP)
+	// 3. export Claude-related env vars (not inherited by fresh shell)
+	// 4. run claude with the startup beacon (triggers immediate context loading)
 	// Use exec to ensure clean process replacement.
-	// IMPORTANT: Passing "gt prime" as argument injects it as the first prompt,
-	// which triggers the agent to execute immediately. Without this, agents
-	// wait for user input despite all GUPP prompting in hooks.
-	runtimeCmd := config.GetRuntimeCommandWithPrompt("", "gt prime")
+	runtimeCmd := config.GetRuntimeCommandWithPrompt("", beacon)
+
+	// Build environment exports - role vars first, then Claude vars
+	var exports []string
 	if gtRole != "" {
-		return fmt.Sprintf("cd %s && export GT_ROLE=%s BD_ACTOR=%s GIT_AUTHOR_NAME=%s && exec %s", workDir, gtRole, gtRole, gtRole, runtimeCmd), nil
+		runtimeConfig := config.LoadRuntimeConfig("")
+		exports = append(exports, "GT_ROLE="+gtRole)
+		exports = append(exports, "BD_ACTOR="+gtRole)
+		exports = append(exports, "GIT_AUTHOR_NAME="+gtRole)
+		if runtimeConfig.Session != nil && runtimeConfig.Session.SessionIDEnv != "" {
+			exports = append(exports, "GT_SESSION_ID_ENV="+runtimeConfig.Session.SessionIDEnv)
+		}
+	}
+
+	// Add Claude-related env vars from current environment
+	for _, name := range claudeEnvVars {
+		if val := os.Getenv(name); val != "" {
+			// Shell-escape the value in case it contains special chars
+			exports = append(exports, fmt.Sprintf("%s=%q", name, val))
+		}
+	}
+
+	if len(exports) > 0 {
+		return fmt.Sprintf("cd %s && export %s && exec %s", workDir, strings.Join(exports, " "), runtimeCmd), nil
 	}
 	return fmt.Sprintf("cd %s && exec %s", workDir, runtimeCmd), nil
 }
@@ -587,16 +631,37 @@ func sendHandoffMail(subject, message string) (string, error) {
 }
 
 // looksLikeBeadID checks if a string looks like a bead ID.
-// Bead IDs have format: prefix-xxxx where prefix is 2+ letters and xxxx is alphanumeric.
+// Bead IDs have format: prefix-xxxx where prefix is 1-5 lowercase letters and xxxx is alphanumeric.
+// Examples: "gt-abc123", "bd-ka761", "hq-cv-abc", "beads-xyz", "ap-qtsup.16"
 func looksLikeBeadID(s string) bool {
-	// Common bead prefixes
-	prefixes := []string{"gt-", "hq-", "bd-", "beads-"}
-	for _, p := range prefixes {
-		if strings.HasPrefix(s, p) {
-			return true
+	// Find the first hyphen
+	idx := strings.Index(s, "-")
+	if idx < 1 || idx > 5 {
+		// No hyphen, or prefix is empty/too long
+		return false
+	}
+
+	// Check prefix is all lowercase letters
+	prefix := s[:idx]
+	for _, c := range prefix {
+		if c < 'a' || c > 'z' {
+			return false
 		}
 	}
-	return false
+
+	// Check there's something after the hyphen
+	rest := s[idx+1:]
+	if len(rest) == 0 {
+		return false
+	}
+
+	// Check rest starts with alphanumeric and contains only alphanumeric, dots, hyphens
+	first := rest[0]
+	if !((first >= 'a' && first <= 'z') || (first >= '0' && first <= '9')) {
+		return false
+	}
+
+	return true
 }
 
 // hookBeadForHandoff attaches a bead to the current agent's hook.
